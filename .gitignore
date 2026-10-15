@@ -1,0 +1,22 @@
+# env / secrets
+.env
+.env.*
+!.env.example
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+
+# node
+node_modules/
+.next/
+out/
+
+# data (fetched, not committed; GTFS is ODbL)
+data/
+
+.DS_Store
