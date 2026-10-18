@@ -192,7 +192,7 @@ when the road delay crosses the threshold or the recommendation changes.
 Live traffic already shows today's jam, rain or festival **as it happens**. Conditions covers what live traffic can't:
 predictions for a later time, metro/bus timing changes, and keeping odd days out of our history.
 
-**Weather** (`providers/weather/open_meteo.py`: free, no key, hourly forecast + 15-min rain amounts):
+**Weather** (`conditions/weather/open_meteo.py`: free, no key, hourly forecast + 15-min rain amounts):
 | Rain level | Effect (config) |
 |---|---|
 | none / light (< 2.5 mm/h) | none |
@@ -253,7 +253,8 @@ are file swaps, not migrations.
 |---|---|---|
 | POST | `/v1/plan` | `{origin, destination, depart_at?, vehicles[], max_walk_m?, avoid[]?}` → options, recommendation, reasons |
 | GET | `/v1/nearby?lat=&lon=` | nearest metro stations (entrance + gate) and bus stops, with walking time, routes served, how often they run |
-| GET | `/v1/stops/{id}` | one stop: routes, directions, approximate next departures |
+| GET | `/v1/metro/stations`, `/v1/metro/stations/{id}` | lines, gates, first/last train, how often trains run |
+| GET | `/v1/bus/stops/{id}` | one bus stop: routes, direction, approximate next departures |
 | GET | `/v1/leave-advice` | best departure window (weather and events taken into account) |
 | GET | `/v1/conditions?lat=&lon=&at=` | rain now + next 3 h, active/upcoming events nearby (for banners) |
 | CRUD | `/v1/commutes`, `/v1/places`, `/v1/preferences` | per device |
@@ -286,111 +287,136 @@ don't work: the watcher has to stay running, and OTP takes minutes to load its g
 
 ## 7. Repository layout
 
-Rule: **`domain/` and `engine/` never import from `providers/` or `infra/`.** They work only with our own
-models and interfaces. Anything that talks to the outside world (TomTom, OTP, Open-Meteo, Postgres) sits behind an
-interface, has a fake for tests, and gets connected in `main.py`.
+The code is organised **by travel mode**: everything about the metro lives in `modes/metro/`,
+everything about your own bike/car in `modes/private_vehicle/`, and so on. Each mode folder owns its data
+loading, stops/stations, timing, fares/costs and tests. Shared pieces sit around the modes:
+
+- `core/`: models and interfaces every mode uses (LatLng, Leg, TripOption, Conditions).
+- `traffic/`: live road traffic. **It's a shared service, not part of private_vehicle**, because buses
+  (time correction), autos to the station, and leave-time advice all need road traffic too.
+- `journeys/`: combining modes into door-to-door trips (OpenTripPlanner search for bus + metro trips with
+  transfers, the planner, the recommender).
+
+### Import rules (checked in CI with `import-linter`)
+```
+api  →  journeys  →  modes/*  →  traffic, conditions  →  core
+                                                         ↑
+infra (db, cache, quota) is reached only through interfaces defined in core
+```
+- **Modes never import each other.** `metro/` doesn't know `bus/` exists. Only `journeys/` combines them.
+- Adding a new mode (e.g. Namma Yatri autos, Yulu, suburban rail) = add a folder in `modes/` + register it in `journeys/`.
 
 ```
 sari-daari/
 ├── backend/
-│   ├── pyproject.toml · uv.lock
+│   ├── pyproject.toml · uv.lock · .importlinter
 │   ├── src/sari_daari/
-│   │   ├── main.py                  # FastAPI app factory: connects providers → engine → routes
-│   │   ├── config.py                # pydantic-settings: keys, thresholds, penalties, quota split
+│   │   ├── main.py                       # app factory: connects providers, modes, journeys and api
+│   │   ├── config.py                     # pydantic-settings; settings grouped by mode
 │   │   │
-│   │   ├── domain/                  # plain models, no I/O
-│   │   │   ├── geo.py               # LatLng, BBox, geohash cell, haversine
-│   │   │   ├── trip.py              # Mode, Leg, TripOption, DurationRange, Cost
-│   │   │   ├── stop.py              # Stop, Station, Entrance, RouteAtStop
-│   │   │   ├── conditions.py        # RainLevel, Event, Conditions
-│   │   │   └── recommendation.py    # Recommendation, Reason (text key + params, translated in the frontend)
+│   │   ├── core/                         # shared, no I/O
+│   │   │   ├── geo.py                    # LatLng, BBox, geohash cell, haversine, KD-tree helper
+│   │   │   ├── trip.py                   # Mode, Leg, TripOption, DurationRange, Cost
+│   │   │   ├── conditions.py             # RainLevel, Event, Conditions
+│   │   │   ├── recommendation.py         # Recommendation, Reason (text key + params)
+│   │   │   └── ports.py                  # interfaces: RoadRouter, TransitSearch, WeatherProvider, Cache, Quota…
 │   │   │
-│   │   ├── providers/               # one adapter per outside service, each next to its fake
-│   │   │   ├── road/                # base.py (RoadRouter) · tomtom.py · google.py · fake.py
-│   │   │   ├── transit/             # base.py (TransitRouter) · otp.py (GraphQL) · fake.py
-│   │   │   ├── weather/             # base.py (WeatherProvider) · open_meteo.py · fake.py
-│   │   │   └── geocode/             # base.py · tomtom.py · fake.py
+│   │   ├── modes/
+│   │   │   ├── metro/                    # 🚇 Namma Metro (BMRCL)
+│   │   │   │   ├── feed.py               # loads bmrcl.zip: lines, stations, entrances/gates, how often trains run
+│   │   │   │   ├── stations.py           # nearest stations by entrance, lines at a station
+│   │   │   │   ├── timing.py             # ride range, waiting time, interchange penalty, first/last train
+│   │   │   │   ├── fares.py              # fare between two stations from GTFS
+│   │   │   │   ├── overrides.py          # extended hours / closures from curated/metro + events
+│   │   │   │   └── README.md             # data source, caveats, licence
+│   │   │   │
+│   │   │   ├── bus/                      # 🚌 BMTC
+│   │   │   │   ├── feed.py               # loads bmtc.zip: ~10k stops, routes, how often they run, Kannada names
+│   │   │   │   ├── stops.py              # nearby stops with direction ("Towards …"), routes at a stop
+│   │   │   │   ├── timing.py             # timetable time × road delay ratio × bus factor, waiting time
+│   │   │   │   ├── fares.py
+│   │   │   │   └── README.md
+│   │   │   │
+│   │   │   ├── private_vehicle/          # 🏍 🚗 your own bike / car
+│   │   │   │   ├── routes.py             # fastest + 2 alternate routes via traffic/, delay ratio
+│   │   │   │   ├── bike.py               # two-wheeler: rain penalty, per-user correction for filtering through traffic
+│   │   │   │   ├── car.py                # parking time + cost at the destination
+│   │   │   │   ├── costs.py              # fuel ₹/km by vehicle type
+│   │   │   │   └── README.md
+│   │   │   │
+│   │   │   └── last_mile/                # 🚶 🛺 getting to and from a station or stop
+│   │   │       ├── walk.py               # walking time (detour factor; real walking route from OTP on tap)
+│   │   │       ├── auto.py               # auto ETA via traffic/ + waiting time + meter fare
+│   │   │       └── README.md
 │   │   │
-│   │   ├── stops/                   # in-memory stop index from the GTFS feeds
-│   │   │   ├── gtfs_loader.py       # reads bmrcl.zip + bmtc.zip (stops, entrances, routes per stop, how often they run)
-│   │   │   ├── index.py             # cKDTree over projected coordinates
-│   │   │   └── nearby.py            # nearest stations/stops, the right stop for a trip
+│   │   ├── traffic/                      # shared live road traffic
+│   │   │   ├── providers/                # tomtom.py · google.py · fake.py (all follow RoadRouter)
+│   │   │   ├── delay.py                  # delay ratio, cache per stop pair and 15-min slot
+│   │   │   └── tiles.py                  # traffic tile proxy
 │   │   │
-│   │   ├── conditions/              # what's different about this moment
-│   │   │   ├── weather.py           # forecast → RainLevel per hour
-│   │   │   ├── calendar.py          # loads curated/events.yaml + holidays, finds events by time/area
-│   │   │   └── adjust.py            # weather + events → Conditions (pure function)
+│   │   ├── conditions/                   # weather + festivals/events
+│   │   │   ├── weather/                  # open_meteo.py · fake.py · levels.py (mm/h → RainLevel)
+│   │   │   ├── calendar.py               # curated/events.yaml + holidays.yaml
+│   │   │   └── adjust.py                 # weather + events → Conditions (pure)
 │   │   │
-│   │   ├── engine/                  # the actual product logic, pure + async, no HTTP or SQL
-│   │   │   ├── plan.py              # runs road + transit, builds TripOptions
-│   │   │   ├── bus_correction.py    # timetable time × road delay ratio × bus factor
-│   │   │   ├── costs.py             # fuel, parking, auto meter rates, fares from GTFS
-│   │   │   ├── scoring.py           # applies Conditions + user preferences
-│   │   │   ├── recommend.py         # deterministic rules → Recommendation + reasons
-│   │   │   └── leave_time.py        # departAt sweep + rain forecast + events
+│   │   ├── journeys/                     # combines the modes into door-to-door options
+│   │   │   ├── transit_search/           # otp.py (GraphQL) · fake.py: bus + metro + transfers
+│   │   │   ├── planner.py                # runs all modes in parallel → TripOptions
+│   │   │   ├── right_stop.py             # the stop/station the best trip actually starts from
+│   │   │   ├── scoring.py                # applies Conditions + user preferences
+│   │   │   ├── recommend.py              # deterministic rules → Recommendation + reasons
+│   │   │   └── leave_time.py             # departAt sweep + rain forecast + events
 │   │   │
-│   │   ├── api/v1/                  # thin FastAPI routers, request/response schemas only
-│   │   │   ├── plan.py · nearby.py · stops.py · leave_advice.py · conditions.py
-│   │   │   ├── commutes.py · places.py · preferences.py · push.py
-│   │   │   └── geocode.py · tiles.py
+│   │   ├── places/                       # geocoding (TomTom search, cached), saved places
+│   │   ├── commutes/                     # saved commutes, preferences (per device)
 │   │   │
-│   │   ├── infra/                   # Postgres, cache, quota, push delivery
-│   │   │   ├── db.py · models.py    # SQLAlchemy 2 async
-│   │   │   ├── cache.py             # provider_cache (UNLOGGED table)
-│   │   │   ├── quota.py             # api_usage, budget per feature, fallbacks
-│   │   │   ├── observations.py      # writes route_observations with rain/event tags
-│   │   │   └── webpush.py
+│   │   ├── api/v1/                       # thin routers, grouped the same way
+│   │   │   ├── plan.py · leave_advice.py · conditions.py
+│   │   │   ├── metro.py                  # /v1/metro/stations, /v1/metro/stations/{id}
+│   │   │   ├── bus.py                    # /v1/bus/stops/{id}
+│   │   │   ├── nearby.py                 # metro + bus nearby, merged
+│   │   │   ├── places.py · commutes.py · push.py · tiles.py
 │   │   │
-│   │   └── worker/                  # separate process: python -m sari_daari.worker
-│   │       ├── __main__.py          # APScheduler setup
-│   │       ├── commute_watcher.py
-│   │       └── refresh.py           # weekly GTFS fetch → graph rebuild → reload the stop index
+│   │   ├── infra/                        # db.py · models.py · cache.py · quota.py · observations.py · webpush.py
+│   │   └── worker/                       # __main__.py · commute_watcher.py · refresh.py
 │   │
-│   ├── migrations/                  # Alembic
-│   └── tests/
-│       ├── unit/                    # engine, conditions, stops: no network, no database
-│       ├── integration/             # API + Postgres, providers faked
-│       └── fixtures/                # recorded responses: tomtom/ · otp/ · open_meteo/ · gtfs-mini/
+│   ├── migrations/                       # Alembic
+│   └── tests/                            # same layout as src/
+│       ├── modes/{metro,bus,private_vehicle,last_mile}/
+│       ├── traffic/ · conditions/ · journeys/
+│       ├── api/                          # integration: API + Postgres, providers faked
+│       └── fixtures/                     # recorded responses: tomtom/ otp/ open_meteo/ · mini GTFS feeds
 │
-├── curated/                         # data we maintain by hand, changed through reviewed PRs
-│   ├── events.yaml                  # festivals, IPL, bandhs, closures (source link required)
-│   ├── holidays.yaml                # Karnataka public holidays per year
-│   ├── waterlogging.geojson         # flood-prone spots (each with a source)
-│   ├── station_notes.yaml           # e.g. "hard to get an auto at gate B", parking availability
-│   └── schema/                      # JSON Schemas; CI validates the files above against them
+├── curated/                              # hand-maintained data, changed through reviewed PRs, checked against schema/
+│   ├── events.yaml · holidays.yaml       # shared across modes
+│   ├── metro/station_notes.yaml          # "few autos at gate B", entrance quirks
+│   ├── bus/route_notes.yaml              # known-wrong timetables, missing routes
+│   ├── private_vehicle/parking.yaml      # parking cost/time for areas people commute to
+│   ├── roads/waterlogging.geojson        # flood-prone spots, each with a source
+│   └── schema/
 │
-├── otp/
-│   ├── build-config.json · router-config.json · otp-config.json
-│   ├── build_graph.sh · serve.sh
-│   └── graphs/                      # gitignored
+├── otp/                                  # build-config.json · router-config.json · build_graph.sh · serve.sh · graphs/ (ignored)
 │
-├── web/                             # Next.js PWA
-│   ├── app/
-│   │   ├── layout.tsx · manifest.ts
-│   │   ├── page.tsx                 # Plan (home)
-│   │   ├── nearby/page.tsx
-│   │   └── commutes/page.tsx
+├── web/                                  # Next.js PWA
+│   ├── app/                              # page.tsx (Plan) · nearby/ · commutes/ · layout.tsx · manifest.ts
 │   ├── components/
-│   │   ├── map/                     # MapView, TrafficLayer, MetroLines, StopMarkers, RouteLine
-│   │   ├── plan/                    # OptionCard, RecommendationBanner, LegTimeline
-│   │   ├── nearby/                  # StationCard, BusStopCard
-│   │   └── conditions/              # RainChip, EventBanner
-│   ├── lib/
-│   │   ├── api/                     # schema.d.ts (generated from OpenAPI) · client.ts
-│   │   ├── i18n/                    # en.json · kn.json (includes reason text)
-│   │   └── device.ts                # anonymous device id
-│   └── public/                      # icons, sw.js (web push)
+│   │   ├── modes/
+│   │   │   ├── metro/                    # MetroLegCard, StationCard, MetroLinesLayer
+│   │   │   ├── bus/                      # BusLegCard, BusStopCard
+│   │   │   ├── private_vehicle/          # RoadOptionCard, AlternateRoutes
+│   │   │   └── last_mile/                # WalkLeg, AutoLeg
+│   │   ├── map/                          # MapView, TrafficLayer, RouteLine
+│   │   ├── plan/                         # RecommendationBanner, OptionList, LegTimeline
+│   │   └── conditions/                   # RainChip, EventBanner
+│   ├── lib/                              # api/ (generated types + client) · i18n/ (en, kn) · device.ts
+│   └── public/                           # icons, sw.js
 │
-├── scripts/
-│   ├── fetch_data.py                # GTFS zips + OSM extract → data/
-│   ├── cut_osm.sh                   # osmium cut to the Bengaluru bounding box
-│   └── gen_api_types.sh             # FastAPI OpenAPI → web/lib/api/schema.d.ts
-│
-├── data/                            # gitignored: gtfs/, osm/
-├── docs/                            # ARCHITECTURE.md, later ADRs
-├── .github/workflows/ci.yml         # ruff, pytest, curated schema check, web lint/build
-├── Makefile                         # make data · make graph · make dev · make test
-├── .env.example · LICENSE · README.md
+├── scripts/                              # fetch_data.py · cut_osm.sh · gen_api_types.sh
+├── data/                                 # gitignored: gtfs/metro, gtfs/bus, osm/
+├── docs/
+├── .github/workflows/ci.yml              # ruff, import-linter, pytest, curated schema check, web build
+├── Makefile                              # make data · make graph · make dev · make test
+└── .env.example · LICENSE · README.md
 ```
 
 ## 8. Risks and how we handle them
@@ -421,7 +447,7 @@ sari-daari/
 1. **Phase 0: skeleton.** uv project, config, models, fake routers, ruff + pytest.
 2. **Phase 1: data + OTP.** `fetch_data.py`, OSM cut to the city, OTP graph build, OTP client, a few known trips
    (Indiranagar → Majestic, Koramangala → Whitefield) as tests against recorded responses.
-3. **Phase 2: nearby stops.** Loader + KD-tree + `/v1/nearby`, `/v1/stops/{id}`.
+3. **Phase 2: nearby stops.** Loader + KD-tree + `/v1/nearby`, `/v1/metro/stations`, `/v1/bus/stops/{id}`.
 4. **Phase 3: TomTom + `/v1/plan`.** Road options, bus time correction, recommender, quota guard.
 5. **Phase 4: conditions.** Open-Meteo adapter, events.yaml + schema, `adjust.py`, `/v1/conditions`.
 6. **Phase 5: web.** Plan screen, Nearby screen, map with traffic tiles, rain/event banners, Kannada/English.
